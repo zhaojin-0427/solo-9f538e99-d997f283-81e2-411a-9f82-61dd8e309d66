@@ -135,6 +135,40 @@ def main() -> int:
           json.dumps(r))
     check("回退后历史版仍可查", len(stations(COLLECTOR, HOUR, 6)) > 0)
 
+    print("-- 9. 稀疏存储:确认版只记变化值与删除标记")
+    # 逐版快照必须与版本登记一致,且旧全量版(v1)仍原样可查
+    _, vers = req("GET", COLLECTOR, f"/hours/{HOUR}/versions")
+    v1_again = stations(COLLECTOR, HOUR, 1)
+    check("v1 全量版仍可查且未被后续版本改写", v1_again == v1)
+    check("版本列表 station_count 与快照一致",
+          all(len(stations(COLLECTOR, HOUR, v["version"])) == v["station_count"]
+              for v in vers["versions"]))
+    # 删除后重现:显式构造"删除 -> 重现"两版,确认重现版不串用删除前读数
+    req("POST", SOURCE, "/admin/reset", {"station_count": 20, "seed": 20261118})
+    hour2 = os.environ.get("SMOKE_HOUR_2", "2026-11-18T11")
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": hour2})
+    check("第二小时 v1 采集", r["status"] == "ok" and r["confirmed_to"] == 1, json.dumps(r))
+    before = stations(COLLECTOR, hour2, 1)
+    old_pm = before["S05"]
+    req("POST", SOURCE, "/admin/publish",
+        {"ops": [{"station_id": "S05", "op": "delete"}]})
+    req("POST", COLLECTOR, "/collections", {"hour": hour2})
+    gone = stations(COLLECTOR, hour2, 2)
+    check("v2 删除 S05", "S05" not in gone)
+    req("POST", SOURCE, "/admin/publish",
+        {"ops": [{"station_id": "S05", "op": "upsert", "pm25": 7.5}]})
+    req("POST", COLLECTOR, "/collections", {"hour": hour2})
+    back = stations(COLLECTOR, hour2, 3)
+    check("v3 重现站取新读数而非旧值", back.get("S05") == 7.5 and back.get("S05") != old_pm,
+          f"old={old_pm} new={back.get('S05')}")
+    check("v2 删除版仍不含 S05", "S05" not in stations(COLLECTOR, hour2, 2))
+    check("默认查询=最新确认版", stations(COLLECTOR, hour2) == back)
+    _, vers2 = req("GET", COLLECTOR, f"/hours/{hour2}/versions")
+    check("第二小时版本数正确",
+          [(v["version"], v["station_count"]) for v in vers2["versions"]] ==
+          [(1, 20), (2, 19), (3, 20)],
+          json.dumps(vers2["versions"]))
+
     print(f"== smoke 全部通过 ({_checks} 项检查)")
     return 0
 

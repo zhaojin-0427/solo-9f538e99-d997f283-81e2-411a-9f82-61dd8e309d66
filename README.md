@@ -6,7 +6,8 @@
   新增、改值(`upsert`)和删除(`delete`),响应带连续版号 `version`、页号 `page`、
   总页数 `total_pages`。管理接口可发布/切换修订、注入缺页、超时、同版同站冲突故障。
 - **collector**(采集与查询 API,FastAPI + SQLite):采集某 UTC 小时前先固定源站当前版,
-  再逐版补齐;每个确认版的完整快照均可查询;数据与当前版指针在同一事务生效。
+  再逐版补齐;新确认版只存变化值与删除标记(旧的全量版本仍可查并作为基线),
+  每个确认版的完整站点集都能还原;数据与当前版指针在同一事务生效。
 
 ## 快速开始
 
@@ -17,7 +18,7 @@ docker compose up --build
 - 采集/查询 API: http://localhost:8000 (文档 `/docs`)
 - 模拟源站: http://localhost:8001 (文档 `/docs`)
 
-端到端冒烟(35+ 项断言,覆盖缺页/超时/冲突/回退):
+端到端冒烟(38 项断言,覆盖缺页/超时/冲突/回退/稀疏存储/删除后重现):
 
 ```bash
 python3 scripts/smoke.py
@@ -63,11 +64,19 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | 需求 | 实现 |
 | --- | --- |
 | 先固定源站当前版,再逐版补齐 | `collector/app/service.py::_collect`:开头一次 `GET /api/revisions/current` 固定目标,之后 `prev+1..pinned` 逐版抓取 |
+| 新确认版只存变化值与删除标记,不逐版复制未变站点 | 内容写入 `version_changes`(`upsert` 带新读数、`delete` 为删除标记);未变站点不落行 |
+| 旧 SQLite 全量版保持可查并作为基线 | `versions.storage='full'` 由 `entries` 提供;还原时取不晚于该版的最近全量版为基线,再叠加其后的稀疏变更 |
+| 任意确认版还原完整站点集,删除后重现不串版 | `db.py::reconstruct_snapshot`:每站取该版前最后一次变更,删除标记遮住旧读数,重现以新的 `upsert` 为准 |
+| 版本列表站点数准确 | `versions.station_count` 在确认事务内按当时完整站点集写入 |
+| 默认查询不逐版回放历史 | 每小时一份 `current_entries` 物化快照,随确认事务增量维护;默认查询直接读它 |
+| 采集与查询交错时读数/版号/站点数同源 | 查询在 `read_tx` 的只读事务里取同一已提交快照;采集在 `tx` 里一次提交 |
+| 存储失败或重启不留半版,不改变原供数版 | 变更/物化快照/版本登记/指针在同一事务;写入失败只记 `failed`;启动时按 `current_state_version` 校验并重建物化快照 |
 | 缺页/超时/同版同站冲突时保留原供数版 | 错误只更新 `hours.status/last_error`,`current_version` 指针不动;失败版及后续版不确认 |
 | 重试不能混入残页 | 页面只存内存、从不落库;每次重试从第 1 页整版重取(`_fetch_version`) |
-| 已确认版均可查当时完整数据 | 每版确认时物化全量快照到 `entries`,`GET /hours/{hour}/data?version=N` |
-| 数据与当前版指针一同生效 | 单事务写入 `versions` + `entries` + `hours.current_version`(`db.py::tx`) |
-| 失败或重启不得暴露半版 | 事务原子提交;启动时仅复位 `collecting` 状态元信息;SQLite WAL + 数据卷持久化 |
+| 失败或重启不得暴露半版 | 事务原子提交;启动时仅复位 `collecting` 状态元信息并校验物化快照;SQLite WAL + 数据卷持久化 |
+
+> 迁移说明:旧库启动时自动补 `versions.storage`/`hours.current_state_version` 两列,
+> 既有版本标记为 `full` 保持不变;`current_entries` 由旧数据重建一次,之后增量维护。
 
 ## API 一览
 
@@ -78,7 +87,7 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | POST | `/collections` | 采集某 UTC 小时,body `{"hour":"YYYY-MM-DDTHH"}`;采集中返回 409 |
 | GET | `/collections/{hour}` | 该小时采集状态/最近错误 |
 | GET | `/hours` | 全部小时及当前版指针 |
-| GET | `/hours/{hour}/versions` | 已确认版列表 |
+| GET | `/hours/{hour}/versions` | 已确认版列表(含 `station_count`、`storage`=full/sparse) |
 | GET | `/hours/{hour}/data` | 某版完整数据;`version` 缺省取当前版,`station_id` 可单站过滤 |
 
 **source(8001)**

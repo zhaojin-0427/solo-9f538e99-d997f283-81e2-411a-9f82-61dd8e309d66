@@ -87,17 +87,19 @@ def list_versions(hour: str):
     hour = _check_hour(hour)
     db = dbmod.connect()
     try:
-        row = dbmod.get_hour(db, hour)
-        if row is None:
-            raise HTTPException(404, f"hour {hour} never collected")
-        vers = db.execute(
-            "SELECT * FROM versions WHERE hour=? ORDER BY version", (hour,)
-        ).fetchall()
-        return {
-            "hour": hour,
-            "current_version": row["current_version"],
-            "versions": [dict(v) for v in vers],
-        }
+        # 指针、版本列表与站点数取自同一个已提交快照
+        with dbmod.read_tx(db):
+            row = dbmod.get_hour(db, hour)
+            if row is None:
+                raise HTTPException(404, f"hour {hour} never collected")
+            vers = db.execute(
+                "SELECT * FROM versions WHERE hour=? ORDER BY version", (hour,)
+            ).fetchall()
+            return {
+                "hour": hour,
+                "current_version": row["current_version"],
+                "versions": [dict(v) for v in vers],
+            }
     finally:
         db.close()
 
@@ -112,36 +114,39 @@ def hour_data(
     hour = _check_hour(hour)
     db = dbmod.connect()
     try:
-        row = dbmod.get_hour(db, hour)
-        if row is None:
-            raise HTTPException(404, f"hour {hour} never collected")
-        v = version if version is not None else row["current_version"]
-        if v == 0:
-            raise HTTPException(404, f"hour {hour} has no confirmed version yet")
-        vrow = db.execute(
-            "SELECT * FROM versions WHERE hour=? AND version=?", (hour, v)
-        ).fetchone()
-        if vrow is None:
-            raise HTTPException(404, f"version {v} of hour {hour} is not confirmed")
-        if station_id is not None:
-            rows = db.execute(
-                "SELECT station_id, pm25 FROM entries WHERE hour=? AND version=? AND station_id=?",
-                (hour, v, station_id),
-            ).fetchall()
-            if not rows:
-                raise HTTPException(404, f"station {station_id} not present in version {v}")
-        else:
-            rows = db.execute(
-                "SELECT station_id, pm25 FROM entries WHERE hour=? AND version=? "
-                "ORDER BY station_id",
-                (hour, v),
-            ).fetchall()
-        return {
-            "hour": hour,
-            "version": v,
-            "is_current": v == row["current_version"],
-            "station_count": len(rows),
-            "stations": [{"station_id": r["station_id"], "pm25": r["pm25"]} for r in rows],
-        }
+        # 版号、读数与站点数来自同一个已提交快照:采集并发提交也不会撕裂
+        with dbmod.read_tx(db):
+            row = dbmod.get_hour(db, hour)
+            if row is None:
+                raise HTTPException(404, f"hour {hour} never collected")
+            v = version if version is not None else row["current_version"]
+            if v == 0:
+                raise HTTPException(404, f"hour {hour} has no confirmed version yet")
+            vrow = dbmod.get_version(db, hour, v)
+            if vrow is None:
+                raise HTTPException(404, f"version {v} of hour {hour} is not confirmed")
+            # 默认查当前版:直接读物化快照,不逐版回放历史。
+            # 历史版:以旧全量版本为基线叠加稀疏变更还原。
+            if v == row["current_version"] == row["current_state_version"]:
+                snap = dbmod.current_snapshot(db, hour)
+            else:
+                snap = dbmod.reconstruct_snapshot(db, hour, v)
+            if station_id is not None:
+                if station_id not in snap:
+                    raise HTTPException(
+                        404, f"station {station_id} not present in version {v}"
+                    )
+                stations = [{"station_id": station_id, "pm25": snap[station_id]}]
+            else:
+                stations = [
+                    {"station_id": sid, "pm25": pm} for sid, pm in sorted(snap.items())
+                ]
+            return {
+                "hour": hour,
+                "version": v,
+                "is_current": v == row["current_version"],
+                "station_count": len(stations),
+                "stations": stations,
+            }
     finally:
         db.close()

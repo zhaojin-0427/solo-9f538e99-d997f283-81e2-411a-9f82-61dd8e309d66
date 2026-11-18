@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,10 @@ class SourceError(CollectError):
 
 class HourBusy(Exception):
     """同一小时已有采集在进行。"""
+
+
+class ConcurrentUpdate(CollectError):
+    """提交时发现指针已被其他采集推进(跨进程场景),放弃本次提交。"""
 
 
 _locks: dict[str, threading.Lock] = {}
@@ -177,8 +182,13 @@ def _collect(hour: str) -> dict:
     attempts: dict[int, int] = {}
     try:
         dbmod.ensure_hour(db, hour, _now())
-        row = dbmod.get_hour(db, hour)
-        prev_current = row["current_version"]
+        # 兼容旧库/中断状态:确保物化当前快照与指针一致
+        dbmod.ensure_current_state(db, hour)
+        # 指针与基线快照取自同一个已提交快照(默认查询走物化表,不回放历史)
+        with dbmod.read_tx(db):
+            row = dbmod.get_hour(db, hour)
+            prev_current = row["current_version"]
+            base_snap = dbmod.current_snapshot(db, hour)
 
         with httpx.Client(base_url=SOURCE_BASE_URL, timeout=PAGE_TIMEOUT) as client:
             # 1) 先固定源站当前版
@@ -205,43 +215,55 @@ def _collect(hour: str) -> dict:
 
             # 2) 逐版补齐:prev_current+1 .. pinned
             confirmed = prev_current
-            for version in range(prev_current + 1, pinned + 1):
-                base = dbmod.snapshot(db, hour, version - 1)
-                last_err: Exception | None = None
-                ok = False
-                for attempt in range(1, MAX_ATTEMPTS + 1):
-                    try:
-                        total, items = _fetch_version(client, version)
-                        new_snap = _apply(base, items)
-                        # 3) 数据与当前版指针在同一事务生效
-                        with dbmod.tx(db):
-                            db.execute(
-                                "INSERT INTO versions(hour, version, total_pages, item_count, "
-                                "station_count, confirmed_at) VALUES (?,?,?,?,?,?)",
-                                (hour, version, total, len(items), len(new_snap), _now()),
+            try:
+                for version in range(prev_current + 1, pinned + 1):
+                    last_err: Exception | None = None
+                    ok = False
+                    for attempt in range(1, MAX_ATTEMPTS + 1):
+                        try:
+                            total, items = _fetch_version(client, version)
+                            new_snap = _apply(base_snap, items)
+                            # 3) 变更、当前快照、版本登记与指针在同一事务生效
+                            dbmod.commit_sparse_version(
+                                db,
+                                hour,
+                                version,
+                                total_pages=total,
+                                items=items,
+                                new_snapshot=new_snap,
+                                now=_now(),
                             )
-                            db.executemany(
-                                "INSERT INTO entries(hour, version, station_id, pm25) "
-                                "VALUES (?,?,?,?)",
-                                [(hour, version, sid, pm) for sid, pm in sorted(new_snap.items())],
+                            base_snap = new_snap
+                            confirmed = version
+                            attempts[version] = attempt
+                            ok = True
+                            break
+                        except dbmod.StaleBase as e:
+                            # 基线已失效:不重试,也不覆盖其他采集已提交的状态
+                            raise ConcurrentUpdate(str(e)) from e
+                        except sqlite3.Error as e:
+                            # 存储失败:事务已整体回滚,原供数版与指针保持不变
+                            msg = f"version {version} storage error: {e}"
+                            _mark(db, hour, "failed", msg)
+                            return _summary(
+                                hour, "failed", pinned, prev_current, confirmed, msg, attempts
                             )
-                            db.execute(
-                                "UPDATE hours SET current_version=?, updated_at=? WHERE hour=?",
-                                (version, _now(), hour),
-                            )
-                        confirmed = version
-                        attempts[version] = attempt
-                        ok = True
-                        break
-                    except CollectError as e:
-                        last_err = e
-                        if attempt < MAX_ATTEMPTS:
-                            time.sleep(RETRY_BACKOFF * attempt)
-                if not ok:
-                    # 缺页/超时/冲突:保留原供数版,指针不动,停止后续版本
-                    msg = f"version {version} failed after {MAX_ATTEMPTS} attempts: {last_err}"
-                    _mark(db, hour, "failed", msg)
-                    return _summary(hour, "failed", pinned, prev_current, confirmed, msg, attempts)
+                        except CollectError as e:
+                            last_err = e
+                            if attempt < MAX_ATTEMPTS:
+                                time.sleep(RETRY_BACKOFF * attempt)
+                    if not ok:
+                        # 缺页/超时/冲突:保留原供数版,指针不动,停止后续版本
+                        msg = f"version {version} failed after {MAX_ATTEMPTS} attempts: {last_err}"
+                        _mark(db, hour, "failed", msg)
+                        return _summary(hour, "failed", pinned, prev_current, confirmed, msg, attempts)
+            except ConcurrentUpdate as e:
+                # 另一采集已提交更新的版本;本次不写任何状态,按实际指针如实汇报
+                row = dbmod.get_hour(db, hour)
+                now_current = row["current_version"] if row else confirmed
+                return _summary(
+                    hour, "concurrent", pinned, prev_current, now_current, str(e), attempts
+                )
 
             _mark(db, hour, "ok")
             return _summary(hour, "ok", pinned, prev_current, confirmed, None, attempts)
